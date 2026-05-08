@@ -1,0 +1,2422 @@
+// =====================================================================
+// Prisma Schema — نظام ERP لإدارة الكليات التقنية
+// كلية الاتصالات والمعلومات بالرياض (CCI-Riyadh)
+//
+// نموذج Multi-tenant:
+//   - tenant_id موجود في كل جدول قابل للعزل
+//   - عند تفعيل TENANCY_MODE=schema_per_tenant يتم إنشاء schema منفصل لكل tenant
+//   - في وضع row_level، الـ tenant interceptor يحقن tenantId تلقائياً
+//
+// التغطية:
+//   1. Tenancy & Identity (Tenant, User, Session)
+//   2. RBAC (Role, Permission, RolePermission, UserRole)
+//   3. Org Structure (Department, Position, Assignment)
+//   4. HR (Employee, Leave, Attendance, Contract)
+//   5. Council (Council, Meeting, Decision, Vote)
+//   6. Finance (Budget, PurchaseRequest, Invoice, Approval)
+//   7. Trainees (Trainee, Enrollment, AcademicRecord)
+//   8. Trainers (Trainer, TeachingLoad, Evaluation)
+//   9. Academic (Program, Course, Section, Schedule, Attendance)
+//   10. LMS (LmsCourse, ExamBank, Question, Submission)
+//   11. IT Helpdesk (Ticket, Asset, Backup)
+//   12. Quality (Kpi, KpiMeasurement, Survey, Risk)
+//   13. Community Center (Course, Registration, Payment, Certificate)
+//   14. Research (ResearchProject, Innovation, Funding)
+//   15. General Services (MaintenanceRequest, SecurityIncident, MedicalVisit)
+//   16. Workflow Engine (WorkflowDefinition, WorkflowInstance, ApprovalStep)
+//   17. Audit & Notifications
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// 1. TENANCY & IDENTITY
+// =====================================================================
+
+model Tenant {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  nameAr      String
+  nameEn      String?
+  type        TenantType @default(COLLEGE)
+  parentId    String?
+  parent      Tenant?  @relation("TenantHierarchy", fields: [parentId], references: [id])
+  children    Tenant[] @relation("TenantHierarchy")
+  status      TenantStatus @default(ACTIVE)
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users         User[]
+  departments   Department[]
+  roles         Role[]
+  councils      Council[]
+  employees     Employee[]
+  trainees      Trainee[]
+  trainers      Trainer[]
+  programs      Program[]
+  courses       Course[]
+  budgets       Budget[]
+  workflowDefs  WorkflowDefinition[]
+  workflowInsts WorkflowInstance[]
+  auditLogs     AuditLog[]
+  notifications Notification[]
+  attachments   Attachment[]
+  tickets       Ticket[]
+  assets        Asset[]
+  kpis          Kpi[]
+  surveys       Survey[]
+  risks         Risk[]
+  ccCourses     CommunityCourse[]
+  research      ResearchProject[]
+  maintenance   MaintenanceRequest[]
+  securityInc   SecurityIncident[]
+  medicalVisits MedicalVisit[]
+  qualityImprovementPlans QualityImprovementPlan[] @relation("TenantQIP")
+
+  @@map("tenants")
+}
+
+enum TenantType {
+  COLLEGE        // كلية رئيسية
+  BRANCH         // فرع
+  INSTITUTE      // معهد تابع
+  PRISON_INSTITUTE  // معهد سجن
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+model User {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email         String
+  username      String?
+  passwordHash  String
+  fullNameAr    String
+  fullNameEn    String?
+  nationalId    String?
+  phone         String?
+  avatarUrl     String?
+  status        UserStatus @default(ACTIVE)
+  lastLoginAt   DateTime?
+  mfaEnabled    Boolean  @default(false)
+  mfaSecret     String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sessions       Session[]
+  userRoles      UserRole[]
+  employeeProfile Employee?
+  traineeProfile  Trainee?
+  trainerProfile  Trainer?
+  uploadedFiles   Attachment[] @relation("UploadedBy")
+  startedFlows    WorkflowInstance[] @relation("InitiatedBy")
+  approvalsActed  ApprovalStep[] @relation("ActedBy")
+  auditLogs       AuditLog[]
+  notifications   Notification[]
+  ticketsCreated  Ticket[] @relation("TicketCreator")
+  ticketsAssigned Ticket[] @relation("TicketAssignee")
+
+  @@unique([tenantId, email])
+  @@unique([tenantId, username])
+  @@index([tenantId])
+  @@map("users")
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  LOCKED
+  PENDING_VERIFICATION
+}
+
+model Session {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String
+  userAgent       String?
+  ip              String?
+  expiresAt       DateTime
+  revokedAt       DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// =====================================================================
+// 2. RBAC
+// =====================================================================
+
+model Role {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  code        String   // e.g., DEAN, VICE_DEAN, DEPT_HEAD, COORDINATOR, TRAINER, EMPLOYEE, TRAINEE, AUDITOR
+  nameAr      String
+  nameEn      String?
+  description String?
+  scope       RoleScope @default(TENANT)
+  systemRole  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+enum RoleScope {
+  GLOBAL          // super admin
+  TENANT          // على مستوى الكلية
+  DEPARTMENT      // على مستوى القسم
+  UNIT            // وحدة محددة
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  code        String   @unique  // e.g., council.meeting.create, finance.purchase.approve
+  module      String   // e.g., council, finance, hr
+  action      String   // e.g., create, read, update, delete, approve
+  resource    String   // e.g., meeting, purchase, leave
+  nameAr      String
+  description String?
+  createdAt   DateTime @default(now())
+
+  rolePermissions RolePermission[]
+
+  @@index([module])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  conditions   Json?      // ABAC-style conditions (department-scoped, amount-limit, etc.)
+  createdAt    DateTime   @default(now())
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  id           String   @id @default(cuid())
+  userId       String
+  roleId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role         Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  scopeType    String?  // 'department' | 'unit' | null
+  scopeId      String?  // ID of the scoped entity
+  validFrom    DateTime @default(now())
+  validUntil   DateTime?
+  assignedById String?
+  createdAt    DateTime @default(now())
+
+  @@unique([userId, roleId, scopeType, scopeId])
+  @@index([userId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+// =====================================================================
+// 3. ORG STRUCTURE
+// =====================================================================
+
+model Department {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  code        String   // CCI-DEAN, CCI-VICE-TRAINEES, ...
+  nameAr      String
+  nameEn      String?
+  type        DepartmentType
+  parentId    String?
+  parent      Department?  @relation("DepartmentHierarchy", fields: [parentId], references: [id])
+  children    Department[] @relation("DepartmentHierarchy")
+  managerId   String?      // current manager (Employee)
+  costCenter  String?
+  status      DepartmentStatus @default(ACTIVE)
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  positions   Position[]
+  assignments Assignment[]
+  employees   Employee[]   @relation("EmployeeDepartment")
+  managedBy   Employee?    @relation("DepartmentManager", fields: [managerId], references: [id])
+  budgets     Budget[]
+  meetings    Meeting[]
+  purchaseReqs PurchaseRequest[]
+  courses     Course[]
+  trainingPlans     TrainingPlan[]      @relation("DeptTrainingPlans")
+  supervisionVisits SupervisionVisit[]  @relation("DeptSupervisionVisits")
+  curriculumReviews CurriculumReview[]  @relation("DeptCurriculumReviews")
+
+  @@unique([tenantId, code])
+  @@index([tenantId, parentId])
+  @@map("departments")
+}
+
+enum DepartmentType {
+  COUNCIL              // مجلس المنشأة
+  COUNCIL_SECRETARIAT  // أمانة المجلس
+  DEANSHIP             // العمادة
+  VICE_DEANSHIP        // وكالة (مدربين/متدربين/جودة)
+  INSTITUTE_MGMT       // إدارة المعهد
+  SECRETARIAT          // السكرتارية
+  MONITORING_UNIT      // وحدة الرقابة
+  COMMUNICATION_UNIT   // وحدة الاتصال المؤسسي
+  IT_UNIT              // وحدة تقنية المعلومات
+  RESEARCH_CENTER      // مركز البحث والابتكار
+  COMMUNITY_CENTER     // مركز خدمة المجتمع
+  TRAINING_DEPT        // قسم تدريبي
+  ELEARNING_DEPT       // قسم التدرب الإلكتروني
+  CURRICULUM_UNIT      // وحدة المناهج والإشراف
+  ADMISSION_DEPT       // قسم القبول والتسجيل
+  GUIDANCE_UNIT        // وحدة الخدمات الإرشادية
+  ACTIVITIES_UNIT      // وحدة الأنشطة
+  COOP_TRAINING_UNIT   // وحدة التدريب التعاوني
+  JOB_COORD_DEPT       // قسم التنسيق الوظيفي
+  FINANCE_DEPT         // قسم الشؤون المالية
+  HR_DEPT              // قسم الشؤون الإدارية
+  GENERAL_SERVICES     // قسم الخدمات العامة
+  WAREHOUSE            // المستودع
+  TREASURY             // الصندوق
+  ACCOUNTING           // المحاسبة
+  ADMIN_COMMUNICATION  // وحدة الاتصالات الإدارية
+  EMPLOYEE_AFFAIRS     // شؤون الموظفين
+  SECURITY             // وحدة الأمن
+  MAINTENANCE          // وحدة المرافق والصيانة
+  HEALTH_SAFETY        // وحدة الصحة والسلامة
+  CLINIC               // العيادة الطبية
+  QUALITY_CONTROL_UNIT // وحدة ضبط الجودة
+  SUPPORT_SERVICES     // إدارة الخدمات المساندة
+  GIRLS_PRISON_DEPT    // قسم تدريب البنات بالسجون
+}
+
+enum DepartmentStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+model Position {
+  id           String   @id @default(cuid())
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  code         String   // DEAN, VICE_DEAN, DEPT_HEAD, COORDINATOR, SECRETARY, AUDITOR, TRAINER, ACCOUNTANT, ...
+  titleAr      String
+  titleEn      String?
+  rank         Int      @default(0)  // للترتيب الهرمي
+  isManagerial Boolean  @default(false)
+  budgetLimit  Decimal? @db.Decimal(15, 2) // سقف الاعتماد المالي (مثال 100,000 للعميد)
+  metadata     Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  assignments  Assignment[]
+
+  @@unique([departmentId, code])
+  @@map("positions")
+}
+
+model Assignment {
+  id           String   @id @default(cuid())
+  positionId   String
+  departmentId String
+  employeeId   String
+  position     Position @relation(fields: [positionId], references: [id])
+  department   Department @relation(fields: [departmentId], references: [id])
+  employee     Employee @relation(fields: [employeeId], references: [id])
+  isPrimary    Boolean  @default(true)
+  isActing     Boolean  @default(false)  // مكلف بدلاً من
+  validFrom    DateTime
+  validUntil   DateTime?
+  decisionRef  String?  // رقم قرار التكليف
+  createdAt    DateTime @default(now())
+
+  @@index([employeeId])
+  @@index([departmentId])
+  @@map("assignments")
+}
+
+// =====================================================================
+// 4. HR — الموارد البشرية
+// =====================================================================
+
+model Employee {
+  id              String   @id @default(cuid())
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId          String?  @unique
+  user            User?    @relation(fields: [userId], references: [id])
+  employeeNumber  String
+  nationalId      String?
+  fullNameAr      String
+  fullNameEn      String?
+  gender          Gender
+  birthDate       DateTime?
+  hireDate        DateTime
+  contractType   ContractType @default(PERMANENT)
+  jobTitleAr     String
+  departmentId   String?
+  department     Department? @relation("EmployeeDepartment", fields: [departmentId], references: [id])
+  managedDepts   Department[] @relation("DepartmentManager")
+  email          String?
+  phone          String?
+  status         EmployeeStatus @default(ACTIVE)
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  assignments    Assignment[]
+  contracts      Contract[]
+  leaves         Leave[]
+  attendance     Attendance[]
+  evaluations    Evaluation[]
+  trainerProfile Trainer?
+
+  @@unique([tenantId, employeeNumber])
+  @@index([tenantId])
+  @@map("employees")
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum ContractType {
+  PERMANENT
+  TEMPORARY
+  CONTRACT
+  VOLUNTEER
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  ON_LEAVE
+  TERMINATED
+  RETIRED
+  SECONDED
+}
+
+model Contract {
+  id          String   @id @default(cuid())
+  employeeId  String
+  employee    Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  type        ContractType
+  startDate   DateTime
+  endDate     DateTime?
+  salary      Decimal? @db.Decimal(15, 2)
+  documentUrl String?
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  @@map("contracts")
+}
+
+model Leave {
+  id           String   @id @default(cuid())
+  employeeId   String
+  employee     Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  type         LeaveType
+  startDate    DateTime
+  endDate      DateTime
+  days         Int
+  reason       String?
+  status       LeaveStatus @default(PENDING)
+  workflowInstanceId String? @unique
+  workflowInstance WorkflowInstance? @relation(fields: [workflowInstanceId], references: [id])
+  attachments  Attachment[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([employeeId, status])
+  @@map("leaves")
+}
+
+enum LeaveType {
+  ANNUAL          // اعتيادية
+  SICK            // مرضية
+  EMERGENCY       // اضطرارية
+  STUDY           // دراسية
+  EXAM            // أداء اختبار
+  POST_SECONDARY  // ما بعد الثانوي
+  EXCEPTIONAL     // استثنائية
+  MATERNITY       // أمومة
+  UNPAID          // بدون راتب
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model Attendance {
+  id          String   @id @default(cuid())
+  employeeId  String
+  employee    Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date        DateTime @db.Date
+  checkIn     DateTime?
+  checkOut    DateTime?
+  delayMins   Int      @default(0)
+  status      AttendanceStatus @default(PRESENT)
+  source      AttendanceSource @default(BIOMETRIC)
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  @@unique([employeeId, date])
+  @@index([date])
+  @@map("attendance")
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  LEAVE
+  OFF
+}
+
+enum AttendanceSource {
+  BIOMETRIC
+  MANUAL
+  MOBILE
+}
+
+model Evaluation {
+  id          String   @id @default(cuid())
+  employeeId  String
+  employee    Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  period      String   // 2025-H1 ...
+  score       Decimal  @db.Decimal(5, 2)
+  rating      EvalRating
+  evaluatorId String?
+  comments    String?
+  workflowInstanceId String? @unique
+  workflowInstance WorkflowInstance? @relation(fields: [workflowInstanceId], references: [id])
+  createdAt   DateTime @default(now())
+
+  @@index([employeeId, period])
+  @@map("evaluations")
+}
+
+enum EvalRating {
+  OUTSTANDING
+  EXCEEDS
+  MEETS
+  BELOW
+  UNSATISFACTORY
+}
+
+// =====================================================================
+// 5. COUNCIL — مجلس المنشأة والاجتماعات
+// =====================================================================
+
+model Council {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  nameAr      String
+  type        CouncilType
+  termFrom    DateTime
+  termUntil   DateTime?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  members     CouncilMember[]
+  meetings    Meeting[]
+
+  @@map("councils")
+}
+
+enum CouncilType {
+  MAIN_COUNCIL    // مجلس المنشأة
+  EXEC_COMMITTEE  // اللجنة التنفيذية
+  WORK_COMMITTEE  // لجان العمل
+}
+
+model CouncilMember {
+  id        String   @id @default(cuid())
+  councilId String
+  council   Council  @relation(fields: [councilId], references: [id], onDelete: Cascade)
+  employeeId String?
+  externalName String?
+  role      String   // رئيس، أمين، عضو، عضو من خارج المؤسسة
+  isInternal Boolean @default(true)
+  validFrom DateTime
+  validUntil DateTime?
+
+  @@map("council_members")
+}
+
+model Meeting {
+  id           String   @id @default(cuid())
+  councilId    String?
+  council      Council? @relation(fields: [councilId], references: [id])
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  titleAr      String
+  agenda       Json     // [{ item, presenter, durationMins }]
+  scheduledAt  DateTime
+  endedAt      DateTime?
+  location     String?
+  status       MeetingStatus @default(SCHEDULED)
+  minutesUrl   String?  // رابط محضر PDF بعد التوقيع
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  attendees    MeetingAttendee[]
+  decisions    Decision[]
+  attachments  Attachment[]
+  workflowInstanceId String? @unique
+  workflowInstance WorkflowInstance? @relation(fields: [workflowInstanceId], references: [id])
+
+  @@index([scheduledAt])
+  @@map("meetings")
+}
+
+enum MeetingStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model MeetingAttendee {
+  id         String   @id @default(cuid())
+  meetingId  String
+  meeting    Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  userId     String?
+  externalName String?
+  status     AttendeeStatus @default(INVITED)
+  joinedAt   DateTime?
+  leftAt     DateTime?
+
+  @@map("meeting_attendees")
+}
+
+enum AttendeeStatus {
+  INVITED
+  CONFIRMED
+  PRESENT
+  ABSENT
+  EXCUSED
+}
+
+model Decision {
+  id          String   @id @default(cuid())
+  meetingId   String
+  meeting     Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  number      String   // قرار رقم 12 / 1446
+  topic       String
+  description String
+  vote        VoteResult @default(PENDING)
+  approvedBy  Int      @default(0)
+  rejectedBy  Int      @default(0)
+  abstained   Int      @default(0)
+  dueDate     DateTime?
+  ownerId     String?  // من سيتولى التنفيذ
+  status      DecisionStatus @default(OPEN)
+  createdAt   DateTime @default(now())
+
+  votes       Vote[]
+
+  @@map("decisions")
+}
+
+enum VoteResult {
+  PENDING
+  APPROVED
+  REJECTED
+  DEFERRED
+}
+
+enum DecisionStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+model Vote {
+  id          String   @id @default(cuid())
+  decisionId  String
+  decision    Decision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+  voterId     String
+  voterRole   String?
+  vote        VoteChoice
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  @@unique([decisionId, voterId])
+  @@map("votes")
+}
+
+enum VoteChoice {
+  APPROVE
+  REJECT
+  ABSTAIN
+}
+
+// =====================================================================
+// 6. FINANCE — الشؤون المالية
+// =====================================================================
+
+model Budget {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  fiscalYear   String   // 1446
+  category     String   // عمليات، مشتريات، صيانة، تأمين، إلخ
+  allocated    Decimal  @db.Decimal(15, 2)
+  spent        Decimal  @db.Decimal(15, 2) @default(0)
+  reserved     Decimal  @db.Decimal(15, 2) @default(0)
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  purchaseRequests PurchaseRequest[]
+
+  @@unique([tenantId, departmentId, fiscalYear, category])
+  @@map("budgets")
+}
+
+model PurchaseRequest {
+  id           String   @id @default(cuid())
+  number       String   @unique // PR-1446-001
+  requesterId  String
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+  budgetId     String?
+  budget       Budget?  @relation(fields: [budgetId], references: [id])
+  type         PurchaseType
+  description  String
+  amount       Decimal  @db.Decimal(15, 2)
+  currency     String   @default("SAR")
+  status       PRStatus @default(DRAFT)
+  workflowInstanceId String? @unique
+  workflowInstance WorkflowInstance? @relation(fields: [workflowInstanceId], references: [id])
+  vendorName   String?
+  expectedDate DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  items        PurchaseItem[]
+  invoices     Invoice[]
+  attachments  Attachment[]
+
+  @@index([departmentId, status])
+  @@map("purchase_requests")
+}
+
+enum PurchaseType {
+  EQUIPMENT
+  TRAINING_NEEDS
+  MAINTENANCE
+  INSURANCE
+  COMMUNITY_CENTER
+  OTHER
+}
+
+enum PRStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  ORDERED
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseItem {
+  id        String   @id @default(cuid())
+  prId      String
+  pr        PurchaseRequest @relation(fields: [prId], references: [id], onDelete: Cascade)
+  nameAr    String
+  qty       Decimal  @db.Decimal(10, 2)
+  unit      String?
+  unitPrice Decimal  @db.Decimal(15, 2)
+  total     Decimal  @db.Decimal(15, 2)
+
+  @@map("purchase_items")
+}
+
+model Invoice {
+  id          String   @id @default(cuid())
+  prId        String?
+  pr          PurchaseRequest? @relation(fields: [prId], references: [id])
+  number      String   @unique
+  vendorName  String
+  amount      Decimal  @db.Decimal(15, 2)
+  vat         Decimal  @db.Decimal(15, 2) @default(0)
+  total       Decimal  @db.Decimal(15, 2)
+  dueDate     DateTime?
+  paidAt      DateTime?
+  status      InvoiceStatus @default(PENDING)
+  attachments Attachment[]
+  createdAt   DateTime @default(now())
+
+  @@map("invoices")
+}
+
+enum InvoiceStatus {
+  PENDING
+  APPROVED
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+// =====================================================================
+// 7. TRAINEES — شؤون المتدربين
+// =====================================================================
+
+model Trainee {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId        String?  @unique
+  user          User?    @relation(fields: [userId], references: [id])
+  studentNumber String
+  nationalId    String?
+  fullNameAr    String
+  fullNameEn    String?
+  gender        Gender
+  birthDate     DateTime?
+  enrollmentDate DateTime
+  programId     String?
+  program       Program? @relation(fields: [programId], references: [id])
+  status        TraineeStatus @default(ACTIVE)
+  gpa           Decimal? @db.Decimal(4, 2)
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  enrollments   Enrollment[]
+  records       AcademicRecord[]
+  warnings      AcademicWarning[]
+  coopPlacements CoopPlacement[]
+  graduation    Graduation?
+  trainerNotes  TrainerNote[]
+
+  @@unique([tenantId, studentNumber])
+  @@index([tenantId, status])
+  @@map("trainees")
+}
+
+enum TraineeStatus {
+  ACTIVE
+  WITHDRAWN
+  SUSPENDED       // إيقاف
+  WARNED          // إنذار
+  GRADUATED
+  EXCEPTIONAL_WD  // انسحاب استثنائي
+  REENROLLED      // إعادة قيد
+}
+
+model AcademicWarning {
+  id        String   @id @default(cuid())
+  traineeId String
+  trainee   Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  level     Int      // 1, 2, 3
+  reason    String
+  issuedAt  DateTime @default(now())
+  expiresAt DateTime?
+
+  @@map("academic_warnings")
+}
+
+model CoopPlacement {
+  id           String   @id @default(cuid())
+  traineeId    String
+  trainee      Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  companyName  String
+  supervisor   String?
+  startDate    DateTime
+  endDate      DateTime
+  status       CoopStatus @default(ACTIVE)
+  evaluation   Decimal? @db.Decimal(5, 2)
+  attachments  Attachment[]
+  createdAt    DateTime @default(now())
+
+  @@map("coop_placements")
+}
+
+enum CoopStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+model Graduation {
+  id           String   @id @default(cuid())
+  traineeId    String   @unique
+  trainee      Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  graduationDate DateTime
+  finalGpa     Decimal  @db.Decimal(4, 2)
+  certificateNumber String?
+  workflowInstanceId String? @unique
+  workflowInstance WorkflowInstance? @relation(fields: [workflowInstanceId], references: [id])
+  createdAt    DateTime @default(now())
+
+  @@map("graduations")
+}
+
+// =====================================================================
+// 8. TRAINERS — شؤون المدربين
+// =====================================================================
+
+model Trainer {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId        String?  @unique
+  user          User?    @relation(fields: [userId], references: [id])
+  employeeId    String?  @unique
+  employee      Employee? @relation(fields: [employeeId], references: [id])
+  trainerNumber String
+  specialization String
+  qualification String?
+  hireDate      DateTime
+  loadHours     Int      @default(0)  // النصاب التدريبي
+  status        TrainerStatus @default(ACTIVE)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  loads         TeachingLoad[]
+  sections      Section[]
+  developmentPlans DevelopmentPlan[]
+  supervisionVisits  SupervisionVisit[]   @relation("TrainerSupervisionVisits")
+  curriculumFeedback CurriculumFeedback[] @relation("TrainerCurriculumFeedback")
+  notes              TrainerNote[]
+  reports            TrainerReport[]
+  classSessions      ClassSession[]
+
+  @@unique([tenantId, trainerNumber])
+  @@map("trainers")
+}
+
+enum TrainerStatus {
+  ACTIVE
+  ON_LEAVE
+  TERMINATED
+  SECONDED
+}
+
+model TeachingLoad {
+  id        String   @id @default(cuid())
+  trainerId String
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  term      String   // 1446-1
+  hours     Int
+  notes     String?
+  createdAt DateTime @default(now())
+
+  @@unique([trainerId, term])
+  @@map("teaching_loads")
+}
+
+model DevelopmentPlan {
+  id        String   @id @default(cuid())
+  trainerId String
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  year      String
+  goals     Json
+  progress  Decimal  @db.Decimal(5, 2) @default(0)
+  status    String   @default("PLANNED")
+  createdAt DateTime @default(now())
+
+  @@map("development_plans")
+}
+
+// =====================================================================
+// 9. ACADEMIC — الأقسام التدريبية، المقررات، الجداول
+// =====================================================================
+
+model Program {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  code      String
+  nameAr    String
+  nameEn    String?
+  level     ProgramLevel
+  durationTerms Int
+  totalCredits Int
+  status    ProgramStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+
+  trainees  Trainee[]
+  courses   Course[]
+
+  @@unique([tenantId, code])
+  @@map("programs")
+}
+
+enum ProgramLevel {
+  DIPLOMA
+  ASSOCIATE
+  BACHELOR
+  SHORT_COURSE
+}
+
+enum ProgramStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+model Course {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  programId   String?
+  program     Program? @relation(fields: [programId], references: [id])
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  code        String
+  nameAr      String
+  nameEn      String?
+  credits     Int
+  hours       Int
+  syllabusUrl String?
+  status      CourseStatus @default(ACTIVE)
+  createdAt   DateTime @default(now())
+
+  sections    Section[]
+
+  @@unique([tenantId, code])
+  @@map("courses")
+}
+
+enum CourseStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+model Section {
+  id         String   @id @default(cuid())
+  courseId   String
+  course     Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  trainerId  String?
+  trainer    Trainer? @relation(fields: [trainerId], references: [id])
+  term       String   // 1446-1
+  capacity   Int      @default(30)
+  enrolled   Int      @default(0)
+  schedule   Json?    // [{ day, from, to, room, type: classroom|lab|workshop }]
+  isLab      Boolean  @default(false)  // حصص المعمل/الورشة تحتاج Safety Check
+  createdAt  DateTime @default(now())
+
+  enrollments    Enrollment[]
+  classSessions  ClassSession[]
+
+  @@map("sections")
+}
+
+model Enrollment {
+  id        String   @id @default(cuid())
+  traineeId String
+  sectionId String
+  trainee   Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  section   Section  @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  grade     Decimal? @db.Decimal(5, 2)
+  status    EnrollStatus @default(ENROLLED)
+  enrolledAt DateTime @default(now())
+
+  records      AcademicRecord[]
+  attendanceRecords TraineeAttendance[]
+
+  @@unique([traineeId, sectionId])
+  @@map("enrollments")
+}
+
+model TraineeAttendance {
+  id           String   @id @default(cuid())
+  enrollmentId String
+  enrollment   Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  date         DateTime @db.Date
+  status       TraineeAttendanceStatus @default(PRESENT)
+  markedById   String?  // المدرب الذي رصد الحضور
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  @@unique([enrollmentId, date])
+  @@index([date])
+  @@map("trainee_attendance")
+}
+
+enum TraineeAttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+enum EnrollStatus {
+  ENROLLED
+  PASSED
+  FAILED
+  WITHDRAWN
+  INCOMPLETE
+}
+
+model AcademicRecord {
+  id           String   @id @default(cuid())
+  traineeId    String
+  enrollmentId String?
+  trainee      Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  enrollment   Enrollment? @relation(fields: [enrollmentId], references: [id])
+  term         String
+  gpa          Decimal  @db.Decimal(4, 2)
+  earnedCredits Int
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  @@map("academic_records")
+}
+
+// =====================================================================
+// 10. LMS — التدرب الإلكتروني
+// =====================================================================
+
+model LmsCourse {
+  id        String   @id @default(cuid())
+  tenantId  String
+  courseId  String?
+  title     String
+  contentUrl String?
+  scormUrl  String?
+  status    String   @default("DRAFT")
+  createdAt DateTime @default(now())
+
+  exams     ExamBank[]
+
+  @@map("lms_courses")
+}
+
+model ExamBank {
+  id          String   @id @default(cuid())
+  lmsCourseId String?
+  lmsCourse   LmsCourse? @relation(fields: [lmsCourseId], references: [id])
+  title       String
+  durationMins Int
+  passingScore Int     @default(60)
+  createdAt   DateTime @default(now())
+
+  questions   Question[]
+  submissions ExamSubmission[]
+
+  @@map("exam_banks")
+}
+
+model Question {
+  id          String   @id @default(cuid())
+  examBankId  String
+  examBank    ExamBank @relation(fields: [examBankId], references: [id], onDelete: Cascade)
+  type        QType
+  textAr      String
+  options     Json?
+  correctAnswer Json?
+  points      Int      @default(1)
+
+  @@map("questions")
+}
+
+enum QType {
+  MCQ
+  MULTIPLE
+  TRUE_FALSE
+  SHORT
+  ESSAY
+}
+
+model ExamSubmission {
+  id          String   @id @default(cuid())
+  examBankId  String
+  examBank    ExamBank @relation(fields: [examBankId], references: [id])
+  traineeId   String
+  startedAt   DateTime
+  submittedAt DateTime?
+  score       Decimal? @db.Decimal(5, 2)
+  answers     Json?
+
+  @@map("exam_submissions")
+}
+
+// =====================================================================
+// 11. IT HELPDESK
+// =====================================================================
+
+model Ticket {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  number      String   @unique
+  creatorId   String
+  creator     User     @relation("TicketCreator", fields: [creatorId], references: [id])
+  assigneeId  String?
+  assignee    User?    @relation("TicketAssignee", fields: [assigneeId], references: [id])
+  category    TicketCategory
+  priority    TicketPriority @default(NORMAL)
+  subject     String
+  description String
+  status      TicketStatus @default(OPEN)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  closedAt    DateTime?
+
+  attachments Attachment[]
+
+  @@index([tenantId, status])
+  @@map("tickets")
+}
+
+enum TicketCategory {
+  HARDWARE
+  SOFTWARE
+  NETWORK
+  ACCESS
+  EMAIL
+  OTHER
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING
+  RESOLVED
+  CLOSED
+  REOPENED
+}
+
+model Asset {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tag         String
+  category    String   // SERVER, LAPTOP, PROJECTOR, ...
+  nameAr      String
+  serial      String?
+  status      AssetStatus @default(IN_USE)
+  assignedToEmpId String?
+  location    String?
+  purchasedAt DateTime?
+  warrantyEnd DateTime?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([tenantId, tag])
+  @@map("assets")
+}
+
+enum AssetStatus {
+  IN_STOCK
+  IN_USE
+  UNDER_MAINTENANCE
+  RETIRED
+  LOST
+}
+
+// =====================================================================
+// 12. QUALITY — الجودة والاعتماد
+// =====================================================================
+
+model Kpi {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  code         String
+  nameAr       String
+  description  String?
+  unit         String?
+  target       Decimal? @db.Decimal(15, 2)
+  frequency    KpiFrequency
+  ownerDeptId  String?
+  createdAt    DateTime @default(now())
+
+  measurements KpiMeasurement[]
+
+  @@unique([tenantId, code])
+  @@map("kpis")
+}
+
+enum KpiFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  SEMESTER
+  YEARLY
+}
+
+model KpiMeasurement {
+  id        String   @id @default(cuid())
+  kpiId     String
+  kpi       Kpi      @relation(fields: [kpiId], references: [id], onDelete: Cascade)
+  period    String
+  value     Decimal  @db.Decimal(15, 2)
+  notes     String?
+  createdAt DateTime @default(now())
+
+  @@unique([kpiId, period])
+  @@map("kpi_measurements")
+}
+
+model Survey {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title     String
+  audience  String   // TRAINEES, EMPLOYEES, GRADUATES, EMPLOYERS
+  questions Json
+  status    String   @default("DRAFT")
+  createdAt DateTime @default(now())
+
+  responses SurveyResponse[]
+
+  @@map("surveys")
+}
+
+model SurveyResponse {
+  id        String   @id @default(cuid())
+  surveyId  String
+  survey    Survey   @relation(fields: [surveyId], references: [id], onDelete: Cascade)
+  respondentId String?
+  answers   Json
+  createdAt DateTime @default(now())
+
+  @@map("survey_responses")
+}
+
+model Risk {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  category    String
+  likelihood  Int      // 1-5
+  impact      Int      // 1-5
+  score       Int      // computed
+  ownerEmpId  String?
+  mitigation  String?
+  status      String   @default("OPEN")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("risks")
+}
+
+// =====================================================================
+// 13. COMMUNITY CENTER — مركز خدمة المجتمع
+// =====================================================================
+
+model CommunityCourse {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  code        String
+  title       String
+  description String?
+  fee         Decimal  @db.Decimal(15, 2)
+  capacity    Int
+  startDate   DateTime
+  endDate     DateTime
+  hours       Int
+  status      String   @default("OPEN")
+  createdAt   DateTime @default(now())
+
+  registrations CommunityRegistration[]
+
+  @@unique([tenantId, code])
+  @@map("community_courses")
+}
+
+model CommunityRegistration {
+  id          String   @id @default(cuid())
+  courseId    String
+  course      CommunityCourse @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  fullNameAr  String
+  nationalId  String?
+  phone       String?
+  email       String?
+  paid        Boolean  @default(false)
+  paidAmount  Decimal? @db.Decimal(15, 2)
+  certificateIssued Boolean @default(false)
+  certificateNumber String?
+  createdAt   DateTime @default(now())
+
+  @@map("community_registrations")
+}
+
+// =====================================================================
+// 14. RESEARCH — البحث والابتكار
+// =====================================================================
+
+model ResearchProject {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title       String
+  abstract    String?
+  leadEmpId   String?
+  status      ResearchStatus @default(PROPOSED)
+  fundingAmount Decimal? @db.Decimal(15, 2)
+  fundingSource String?
+  startDate   DateTime?
+  endDate     DateTime?
+  outcomeUrl  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("research_projects")
+}
+
+enum ResearchStatus {
+  PROPOSED
+  APPROVED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+// =====================================================================
+// 14d. TASKS / PROJECTS / BOARDS — نظام إدارة المهام والمشاريع
+// =====================================================================
+
+model Task {
+  id            String   @id @default(cuid())
+  tenantId      String
+  title         String
+  description   String?  @db.Text
+  status        TaskState @default(NEW)
+  priority      TaskPriority @default(NORMAL)
+  startDate     DateTime?
+  dueDate       DateTime?
+  completedAt   DateTime?
+  assigneeId    String?
+  createdById   String
+  departmentId  String?
+  projectId     String?
+  project       Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  parentTaskId  String?
+  parent        Task?    @relation("TaskSubtasks", fields: [parentTaskId], references: [id])
+  subtasks      Task[]   @relation("TaskSubtasks")
+  tags          String[]
+  attachments   Json?    // [{ name, url, size }]
+  kpiCode       String?  // ربط اختياري بـ KPI
+  reportId      String?  // ربط اختياري بتقرير
+  comments      TaskComment[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@index([assigneeId, status])
+  @@map("tasks")
+}
+
+enum TaskState {
+  NEW
+  IN_PROGRESS
+  PENDING_APPROVAL
+  DONE
+  OVERDUE
+  REJECTED
+  ARCHIVED
+}
+
+enum TaskPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+model TaskComment {
+  id        String   @id @default(cuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([taskId])
+  @@map("task_comments")
+}
+
+model Project {
+  id           String   @id @default(cuid())
+  tenantId     String
+  code         String
+  nameAr       String
+  description  String?  @db.Text
+  type         ProjectType @default(OPERATIONAL)
+  ownerId      String
+  status       ProjectStatus @default(PLANNING)
+  startDate    DateTime
+  targetEndDate DateTime?
+  actualEndDate DateTime?
+  progress     Int      @default(0)  // 0-100
+  budget       Decimal? @db.Decimal(15, 2)
+  departmentId String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  members      ProjectMember[]
+  milestones   Milestone[]
+  tasks        Task[]
+  risks        ProjectRisk[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId, status])
+  @@map("projects")
+}
+
+enum ProjectType {
+  OPERATIONAL
+  STRATEGIC
+  QUALITY
+  TECHNICAL
+  FINANCIAL
+  TRAINING
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
+model ProjectMember {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  role      String   @default("MEMBER")  // OWNER, MANAGER, MEMBER, OBSERVER
+  joinedAt  DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@map("project_members")
+}
+
+model Milestone {
+  id         String   @id @default(cuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  nameAr     String
+  dueDate    DateTime
+  completedAt DateTime?
+  order      Int      @default(0)
+
+  @@index([projectId])
+  @@map("milestones")
+}
+
+model ProjectRisk {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  description String
+  likelihood  Int      // 1-5
+  impact      Int      // 1-5
+  mitigation  String?
+  status      String   @default("OPEN")
+  createdAt   DateTime @default(now())
+
+  @@map("project_risks")
+}
+
+model Board {
+  id           String   @id @default(cuid())
+  tenantId     String
+  nameAr       String
+  type         BoardType @default(TASK)
+  scope        String   // 'unit:DEPT_TRAINING' or 'project:abc' or 'global'
+  ownerId      String
+  createdAt    DateTime @default(now())
+
+  columns      BoardColumn[]
+
+  @@index([tenantId])
+  @@map("boards")
+}
+
+enum BoardType {
+  TASK
+  PROJECT
+  APPROVAL
+  QUALITY
+  RISK
+  UNIT
+  AI_SUGGESTIONS
+}
+
+model BoardColumn {
+  id        String   @id @default(cuid())
+  boardId   String
+  board     Board    @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  nameAr    String
+  color     String?  // hex color
+  order     Int      @default(0)
+
+  cards     BoardCard[]
+
+  @@map("board_columns")
+}
+
+model BoardCard {
+  id          String   @id @default(cuid())
+  columnId    String
+  column      BoardColumn @relation(fields: [columnId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  taskId      String?  // ربط اختياري بمهمة
+  assigneeId  String?
+  dueDate     DateTime?
+  order       Int      @default(0)
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([columnId, order])
+  @@map("board_cards")
+}
+
+// =====================================================================
+// 14e. AI + CHATBOT
+// =====================================================================
+
+model AIConversation {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  title     String   @default("محادثة جديدة")
+  context   String?  // الوحدة/الموضوع
+  messages  AIMessage[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("ai_conversations")
+}
+
+model AIMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   AIConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           AIRole
+  content        String   @db.Text
+  tokens         Int?
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId])
+  @@map("ai_messages")
+}
+
+enum AIRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+// =====================================================================
+// 14f. DATA SYSTEMS — Data Lake + Warehouse + Processing
+// =====================================================================
+
+model DataLakeFile {
+  id          String   @id @default(cuid())
+  tenantId    String
+  category    DataCategory @default(RAW)
+  name        String
+  source      String   // 'upload', 'import', 'export', 'log'
+  mimeType    String?
+  size        Int?
+  storageKey  String?  // مفتاح الملف (مزود تخزين خارجي)
+  url         String?
+  metadata    Json?    // schema, columns, etc
+  uploadedById String
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, category])
+  @@map("data_lake_files")
+}
+
+enum DataCategory {
+  RAW           // بيانات خام
+  PROCESSED     // معالجة
+  ANALYTICS     // تحليلية
+  ARCHIVE       // مؤرشفة
+  AI_TRAINING   // لتدريب AI
+}
+
+model DataWarehouseFact {
+  id          String   @id @default(cuid())
+  tenantId    String
+  factName    String   // fact_tasks, fact_attendance, fact_finance
+  period      String   // 1446-Q1, 2026-03
+  dimensions  Json     // { departmentId, userId, ... }
+  measures    Json     // { count, sum, avg, ... }
+  computedAt  DateTime @default(now())
+
+  @@index([tenantId, factName, period])
+  @@map("data_warehouse_facts")
+}
+
+model DataProcessingJob {
+  id          String   @id @default(cuid())
+  tenantId    String
+  nameAr      String
+  type        ProcessingType
+  schedule    String?  // cron expression أو "manual"
+  source      String?  // الجدول المصدر
+  target      String?  // الجدول الهدف
+  lastRunAt   DateTime?
+  lastStatus  ProcessingStatus?
+  lastError   String?  @db.Text
+  rowsProcessed Int    @default(0)
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("data_processing_jobs")
+}
+
+enum ProcessingType {
+  ETL
+  VALIDATION
+  CLEANING
+  AGGREGATION
+  KPI_COMPUTE
+  AI_INDEXING
+}
+
+enum ProcessingStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+// =====================================================================
+// 14a. TRAINER OPERATIONS — مهام المدرب اليومية
+// =====================================================================
+
+model TrainerNote {
+  id         String   @id @default(cuid())
+  trainerId  String
+  trainer    Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  traineeId  String
+  trainee    Trainee  @relation(fields: [traineeId], references: [id], onDelete: Cascade)
+  body       String   @db.Text
+  visibility NoteVisibility @default(PRIVATE)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([trainerId, traineeId])
+  @@map("trainer_notes")
+}
+
+enum NoteVisibility {
+  PRIVATE       // المدرب فقط
+  TEAM          // كل مدربي القسم
+  ADMINISTRATIVE  // الإدارة فقط
+}
+
+model ClassSession {
+  id              String   @id @default(cuid())
+  trainerId       String
+  trainer         Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  sectionId       String
+  section         Section  @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  date            DateTime @db.Date
+  startTime       DateTime?
+  endTime         DateTime?
+  // Safety check بنود (لازم تكون كلها true قبل بدء حصص الورش/المعامل)
+  safetyCheck     Json?    // { equipmentOk, exitsOk, firstAidOk, electricalOk, notes }
+  // ٣ ضغطات تقرير ما بعد الحصة
+  mood            String?  // 'GREAT' | 'OK' | 'POOR'
+  planCompletion  String?  // 'FULL' | 'PARTIAL' | 'NONE'
+  notes           String?  @db.Text
+  attendanceMarked Boolean @default(false)
+  createdAt       DateTime @default(now())
+
+  @@unique([sectionId, date])
+  @@index([trainerId, date])
+  @@map("class_sessions")
+}
+
+model TrainerReport {
+  id        String   @id @default(cuid())
+  trainerId String
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  period    String   // 'WEEKLY-1446-W12' | 'MONTHLY-1446-3' | 'TERM-1446-1'
+  type      ReportType
+  body      String   @db.Text
+  highlights Json?   // [{ ar }]
+  challenges Json?   // [{ ar }]
+  submittedAt DateTime?
+  reviewedById String?
+  reviewedAt DateTime?
+  reviewerComment String?
+  status    ReportStatus @default(DRAFT)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([trainerId, period])
+  @@map("trainer_reports")
+}
+
+enum ReportType {
+  WEEKLY
+  MONTHLY
+  TERM
+}
+
+enum ReportStatus {
+  DRAFT
+  SUBMITTED
+  REVIEWED
+}
+
+// =====================================================================
+// 14c. QUALITY OPERATIONS — مهام وكيل الجودة ومنسق وحدة ضبط الجودة
+// =====================================================================
+
+model QualityPlan {
+  id            String   @id @default(cuid())
+  tenantId      String
+  fiscalYear    String
+  scope         QualityPlanScope @default(YEARLY)
+  season        String?  // Q1, Q2, Q3, Q4 (للفصلية)
+  goals         Json     // [{ ar, kpiCode, target, ownerEmpId }]
+  activities    Json     // [{ ar, ownerEmpId, startDate, endDate, status }]
+  status        PlanStatus @default(DRAFT)
+  createdById   String
+  approvedAt    DateTime?
+  workflowInstanceId String? @unique
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([tenantId, fiscalYear, scope, season])
+  @@map("quality_plans")
+}
+
+enum QualityPlanScope {
+  SEASONAL
+  YEARLY
+}
+
+model QualityTeam {
+  id              String   @id @default(cuid())
+  tenantId        String
+  nameAr          String
+  charter         Json     // { purposeAr, scopeAr, deliverables, deadline, sponsorEmpId }
+  leadEmpId       String?
+  members         Json     // [{ empId, role, joinedAt }]
+  status          TeamStatus @default(PROPOSED)
+  workflowInstanceId String? @unique
+  relatedKpiCode  String?
+  relatedPlanId   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tasks           QualityTeamTask[]
+
+  @@map("quality_teams")
+}
+
+enum TeamStatus {
+  PROPOSED
+  ACTIVE
+  DISBANDED
+}
+
+model QualityTeamTask {
+  id          String   @id @default(cuid())
+  teamId      String
+  team        QualityTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  title       String
+  assigneeEmpId String?
+  dueAt       DateTime?
+  status      TaskStatus @default(TODO)
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([teamId, status])
+  @@map("quality_team_tasks")
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+model Accreditation {
+  id              String   @id @default(cuid())
+  tenantId        String
+  standardCode    String
+  nameAr          String
+  description     String?
+  cycle           String
+  status          AccreditationStatus @default(NOT_STARTED)
+  responsibleEmpId String?
+  dueDate         DateTime?
+  weight          Int      @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  evidence        AccreditationEvidence[]
+
+  @@unique([tenantId, standardCode, cycle])
+  @@index([tenantId, status])
+  @@map("accreditations")
+}
+
+enum AccreditationStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  EVIDENCE_READY
+  VERIFIED
+  WEAK
+}
+
+model AccreditationEvidence {
+  id              String   @id @default(cuid())
+  accreditationId String
+  accreditation   Accreditation @relation(fields: [accreditationId], references: [id], onDelete: Cascade)
+  fileName        String
+  url             String?
+  description     String?
+  uploadedById    String
+  createdAt       DateTime @default(now())
+
+  @@map("accreditation_evidence")
+}
+
+model TrainingOutcome {
+  id              String   @id @default(cuid())
+  tenantId        String
+  departmentId    String
+  term            String
+  passRate        Decimal? @db.Decimal(5, 2)
+  employmentRate  Decimal? @db.Decimal(5, 2)
+  employerSatisfaction Decimal? @db.Decimal(5, 2)
+  studentSatisfaction  Decimal? @db.Decimal(5, 2)
+  notes           String?
+  measuredById    String
+  measuredAt      DateTime @default(now())
+
+  @@unique([tenantId, departmentId, term])
+  @@map("training_outcomes")
+}
+
+model Nomination {
+  id              String   @id @default(cuid())
+  tenantId        String
+  employeeId      String
+  courseTitle     String
+  providerName    String?
+  startDate       DateTime
+  endDate         DateTime
+  cost            Decimal? @db.Decimal(15, 2)
+  justification   String
+  status          NominationStatus @default(PROPOSED)
+  workflowInstanceId String? @unique
+  attendanceConfirmed Boolean @default(false)
+  outcomeNotes    String?
+  recommendedById String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@map("nominations")
+}
+
+enum NominationStatus {
+  PROPOSED
+  APPROVED
+  REJECTED
+  ATTENDED
+  NO_SHOW
+}
+
+model DGReport {
+  id              String   @id @default(cuid())
+  tenantId        String
+  period          String
+  type            DGReportType
+  title           String
+  body            String   @db.Text
+  attachments     Json?
+  submittedById   String?
+  submittedAt     DateTime?
+  trackingNumber  String?
+  gmFeedback      String?  @db.Text
+  gmFeedbackAt    DateTime?
+  status          DGReportStatus @default(DRAFT)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([tenantId, period, type])
+  @@map("dg_reports")
+}
+
+enum DGReportType {
+  QUARTERLY
+  ANNUAL
+}
+
+enum DGReportStatus {
+  DRAFT
+  SUBMITTED
+  ACKNOWLEDGED
+}
+
+model QualityCampaign {
+  id              String   @id @default(cuid())
+  tenantId        String
+  title           String
+  type            CampaignType
+  startDate       DateTime
+  endDate         DateTime
+  targetAudience  String
+  objectiveAr     String
+  materialsUrl    String?
+  attendeesCount  Int?
+  impactAssessment String?
+  ownerEmpId      String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("quality_campaigns")
+}
+
+enum CampaignType {
+  WORKSHOP
+  EVENT
+  MEDIA
+  TRAINING
+}
+
+// =====================================================================
+// 14b. ACADEMIC OPERATIONS — مهام رئيس القسم التدريبي والمدرب
+// =====================================================================
+
+model TrainingPlan {
+  id            String   @id @default(cuid())
+  tenantId      String
+  departmentId  String
+  department    Department @relation("DeptTrainingPlans", fields: [departmentId], references: [id], onDelete: Cascade)
+  fiscalYear    String   // 1446 / 2025-2026
+  scope         TrainingPlanScope @default(YEARLY)
+  goals         Json     // [{ id, ar, kpiCode, target }]
+  activities    Json     // [{ id, ar, ownerEmpId, startDate, endDate, status }]
+  status        PlanStatus @default(DRAFT)
+  createdById   String
+  approvedAt    DateTime?
+  workflowInstanceId String? @unique
+  workflowInstance WorkflowInstance? @relation("TrainingPlanWF", fields: [workflowInstanceId], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([tenantId, departmentId, fiscalYear, scope])
+  @@map("training_plans")
+}
+
+enum TrainingPlanScope {
+  SEASONAL
+  YEARLY
+}
+
+enum PlanStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+model SupervisionVisit {
+  id           String   @id @default(cuid())
+  tenantId     String
+  departmentId String
+  department   Department @relation("DeptSupervisionVisits", fields: [departmentId], references: [id], onDelete: Cascade)
+  trainerId    String
+  trainer      Trainer  @relation("TrainerSupervisionVisits", fields: [trainerId], references: [id], onDelete: Cascade)
+  visitorEmpId String   // رئيس القسم أو الوكيل الزائر
+  visitDate    DateTime
+  sectionId    String?  // الشعبة الزائرة لها (اختياري)
+  rating       Decimal  @db.Decimal(4, 2)  // 0..5
+  observations String
+  recommendations String?
+  followUpAt   DateTime?
+  status       VisitStatus @default(LOGGED)
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId, trainerId])
+  @@index([visitDate])
+  @@map("supervision_visits")
+}
+
+enum VisitStatus {
+  LOGGED
+  FOLLOW_UP_NEEDED
+  CLOSED
+}
+
+model CurriculumReview {
+  id            String   @id @default(cuid())
+  tenantId      String
+  departmentId  String
+  department    Department @relation("DeptCurriculumReviews", fields: [departmentId], references: [id], onDelete: Cascade)
+  programId     String?
+  reviewYear    String
+  scope         String   @default("ANNUAL")
+  marketAlignmentScore Decimal? @db.Decimal(4, 2)
+  recommendations String
+  approvedById  String?
+  status        ReviewStatus @default(IN_PROGRESS)
+  feedbackEntries CurriculumFeedback[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([tenantId, departmentId, reviewYear])
+  @@map("curriculum_reviews")
+}
+
+enum ReviewStatus {
+  IN_PROGRESS
+  APPROVED
+  ARCHIVED
+}
+
+model CurriculumFeedback {
+  id           String   @id @default(cuid())
+  reviewId     String
+  review       CurriculumReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  trainerId    String?
+  trainer      Trainer? @relation("TrainerCurriculumFeedback", fields: [trainerId], references: [id])
+  courseCode   String?
+  feedback     String
+  severity     String   @default("MEDIUM")  // LOW, MEDIUM, HIGH
+  createdAt    DateTime @default(now())
+
+  @@map("curriculum_feedback")
+}
+
+model QualityImprovementPlan {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation("TenantQIP", fields: [tenantId], references: [id], onDelete: Cascade)
+  fiscalYear  String
+  scope       String   // STRATEGIC, OPERATIONAL, KPI_GAP
+  rootCause   String
+  targetKpiCode String?
+  targetValue Decimal? @db.Decimal(15, 2)
+  actions     Json     // [{ ar, ownerEmpId, dueDate, status }]
+  ownerEmpId  String?
+  status      QIPStatus @default(DRAFT)
+  outcomeNotes String?
+  startDate   DateTime?
+  dueDate     DateTime?
+  closedAt    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@map("quality_improvement_plans")
+}
+
+enum QIPStatus {
+  DRAFT
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+// =====================================================================
+// 15. GENERAL SERVICES — الصيانة، الأمن، الصحة
+// =====================================================================
+
+model MaintenanceRequest {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  number      String   @unique
+  requesterId String
+  category    String   // PLUMBING, ELECTRICAL, HVAC, IT, OTHER
+  location    String
+  description String
+  priority    TicketPriority @default(NORMAL)
+  status      MaintStatus @default(OPEN)
+  assignedTo  String?
+  closedAt    DateTime?
+  createdAt   DateTime @default(now())
+
+  @@map("maintenance_requests")
+}
+
+enum MaintStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+model SecurityIncident {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  number      String   @unique
+  occurredAt  DateTime
+  location    String
+  type        String   // INTRUSION, THEFT, FIRE, MEDICAL, OTHER
+  description String
+  severity    String   @default("LOW") // LOW, MEDIUM, HIGH, CRITICAL
+  status      String   @default("OPEN")
+  attachments Attachment[]
+  createdAt   DateTime @default(now())
+
+  @@map("security_incidents")
+}
+
+model MedicalVisit {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patientId   String   // Employee or Trainee user id
+  patientType String   // 'employee' | 'trainee' | 'visitor'
+  visitDate   DateTime
+  symptoms    String?
+  diagnosis   String?
+  prescription String?
+  doctorEmpId String?
+  createdAt   DateTime @default(now())
+
+  @@map("medical_visits")
+}
+
+// =====================================================================
+// 16. WORKFLOW ENGINE — محرك سير الإجراءات والاعتمادات
+// =====================================================================
+
+model WorkflowDefinition {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  code        String   // LEAVE_REQUEST, PR_APPROVAL, MEETING_MINUTES, ...
+  nameAr      String
+  description String?
+  entityType  String   // 'leave', 'purchase_request', 'meeting', ...
+  steps       Json     // [{ key, nameAr, role, scope, condition, sla, parallel }]
+  active      Boolean  @default(true)
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  instances   WorkflowInstance[]
+
+  @@unique([tenantId, code, version])
+  @@map("workflow_definitions")
+}
+
+model WorkflowInstance {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  definitionId String
+  definition   WorkflowDefinition @relation(fields: [definitionId], references: [id])
+  entityType   String
+  entityId     String
+  initiatedById String
+  initiatedBy  User     @relation("InitiatedBy", fields: [initiatedById], references: [id])
+  status       WorkflowStatus @default(IN_PROGRESS)
+  currentStep  String?
+  data         Json?
+  startedAt    DateTime @default(now())
+  completedAt  DateTime?
+  metadata     Json?
+
+  steps        ApprovalStep[]
+  leave        Leave?
+  evaluation   Evaluation?
+  meeting      Meeting?
+  purchaseRequest PurchaseRequest?
+  graduation   Graduation?
+  trainingPlan TrainingPlan? @relation("TrainingPlanWF")
+
+  @@index([entityType, entityId])
+  @@index([tenantId, status])
+  @@map("workflow_instances")
+}
+
+enum WorkflowStatus {
+  IN_PROGRESS
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+model ApprovalStep {
+  id            String   @id @default(cuid())
+  instanceId    String
+  instance      WorkflowInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  stepKey       String
+  stepNameAr    String
+  requiredRole  String?
+  scopeType     String?
+  scopeId       String?
+  status        StepStatus @default(PENDING)
+  actedById     String?
+  actedBy       User?    @relation("ActedBy", fields: [actedById], references: [id])
+  decision      StepDecision?
+  comment       String?
+  dueAt         DateTime?
+  actedAt       DateTime?
+  order         Int
+
+  @@index([instanceId, order])
+  @@map("approval_steps")
+}
+
+enum StepStatus {
+  PENDING
+  ACTIVE
+  APPROVED
+  REJECTED
+  SKIPPED
+  EXPIRED
+}
+
+enum StepDecision {
+  APPROVE
+  REJECT
+  REQUEST_CHANGES
+  DELEGATE
+}
+
+// =====================================================================
+// 17. AUDIT, NOTIFICATIONS, ATTACHMENTS
+// =====================================================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String?
+  tenant     Tenant?  @relation(fields: [tenantId], references: [id])
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String   // CREATE, UPDATE, DELETE, LOGIN, APPROVE, ...
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id         String   @id @default(cuid())
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel    NotifChannel @default(IN_APP)
+  type       String   // workflow.action_required, leave.approved, ...
+  titleAr    String
+  bodyAr     String?
+  link       String?
+  data       Json?
+  readAt     DateTime?
+  sentAt     DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+enum NotifChannel {
+  IN_APP
+  EMAIL
+  SMS
+  PUSH
+}
+
+model Attachment {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ownerType    String   // 'leave', 'meeting', 'purchase_request', ...
+  ownerId      String
+  fileName     String
+  mimeType     String
+  size         Int
+  storageKey   String
+  url          String?
+  uploadedById String
+  uploadedBy   User     @relation("UploadedBy", fields: [uploadedById], references: [id])
+  createdAt    DateTime @default(now())
+
+  leave            Leave?            @relation(fields: [leaveId], references: [id])
+  leaveId          String?
+  meeting          Meeting?          @relation(fields: [meetingId], references: [id])
+  meetingId        String?
+  purchaseRequest  PurchaseRequest?  @relation(fields: [prId], references: [id])
+  prId             String?
+  invoice          Invoice?          @relation(fields: [invoiceId], references: [id])
+  invoiceId        String?
+  ticket           Ticket?           @relation(fields: [ticketId], references: [id])
+  ticketId         String?
+  coopPlacement    CoopPlacement?    @relation(fields: [coopPlacementId], references: [id])
+  coopPlacementId  String?
+  securityIncident SecurityIncident? @relation(fields: [securityIncidentId], references: [id])
+  securityIncidentId String?
+
+  @@index([ownerType, ownerId])
+  @@map("attachments")
+}

@@ -1,0 +1,10 @@
+/* صفحات الطباعة — مشترك */
+@media print {
+  @page { size: A4; margin: 1.5cm; }
+  body { background: white !important; }
+  .no-print { display: none !important; }
+  .print-page { box-shadow: none !important; max-width: 100% !important; }
+  table { page-break-inside: avoid; }
+  thead { display: table-header-group; }
+  h1, h2, h3 { page-break-after: avoid; }
+}
